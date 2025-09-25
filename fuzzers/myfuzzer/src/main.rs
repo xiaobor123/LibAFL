@@ -27,6 +27,10 @@ struct Args {
     /// Firmware load address (hex, default: 0x40205000)
     #[clap(long, value_parser = parse_hex, default_value_t = 0x40205000)]
     load_addr: u64,
+    
+    /// Disassemble output.txt after emulation
+    #[clap(long, default_value_t = true)]
+    disassemble: bool,
 }
 
 fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -59,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 添加debug参数
     if let Some(debug_flags) = &args.debug {
-        raw_options.push_str(&format!("-d {} ", debug_flags));
+        raw_options.push_str(&format!("{} ", debug_flags));
     }
     
     // 添加额外参数以禁用默认存储设备和音频设备
@@ -176,7 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Failed to get CPU with index 0");
     }
-
     // 运行仿真（注意：run是unsafe函数）
     info!("Starting emulation...");
     unsafe {
@@ -193,5 +196,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("QEMU system mode emulation completed");
+    
     Ok(())
 }
