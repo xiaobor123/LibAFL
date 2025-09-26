@@ -1,5 +1,6 @@
 // Simple user mode QEMU emulation example
 use libafl_qemu::{config, config::QemuConfig, Emulator, Regs, QemuExitReason, QemuExitError, QemuShutdownCause};
+use libafl_qemu::command::NopCommandManager;
 use std::{path::PathBuf};
 use log::info;
 use clap::Parser;
@@ -180,22 +181,162 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Failed to get CPU with index 0");
     }
-    // 运行仿真（注意：run是unsafe函数）
-    info!("Starting emulation...");
-    unsafe {
-        match qemu.run() {
-            Ok(QemuExitReason::Timeout) => info!("Emulation timed out"),
-            Ok(QemuExitReason::End(QemuShutdownCause::HostSignal(signal))) => {
-                info!("Emulation terminated by host signal: {:?}", signal);
-                signal.handle()
+        // 设置要hook的函数
+        let function_hooks = vec![
+            FunctionHookConfig {
+                address: 0x405A3ED4, // BL __fixup_smp指令地址
+                action: FunctionHookAction::Skip,
+                instruction_size: 4, // ARM指令是4字节
             },
-            Ok(reason) => info!("Emulation exited with reason: {:?}", reason),
-            Err(QemuExitError::UnexpectedExit) => info!("Emulation crashed with unexpected exit"),
-            Err(e) => info!("Emulation error: {:?}", e),
+            // 可以添加更多的函数hook配置
+            // FunctionHookConfig {
+            //     address: 0x12345678, // 另一个函数地址
+            //     action: FunctionHookAction::ModifyReturnValue(0x0), // 修改返回值为0
+            //     instruction_size: 4,
+            // },
+        ];
+
+        // 运行带函数hook的仿真
+        run_with_function_hooks(&emulator, qemu, function_hooks)?;
+        
+        Ok(())
+}
+
+
+
+// 定义函数跳过策略枚举
+#[derive(Clone)]
+enum FunctionHookAction {
+    Skip,
+    ModifyReturnValue(u32),
+    // 可以添加更多类型的干预策略
+}
+
+// 定义函数hook配置结构体
+#[derive(Clone)]
+struct FunctionHookConfig {
+    address: u64,
+    action: FunctionHookAction,
+    instruction_size: u32, // 指令大小，ARM为4字节，Thumb为2字节
+}
+
+// 通用的函数hook处理函数
+fn setup_function_hook<C: Clone>(
+    emulator: &libafl_qemu::Emulator<C, NopCommandManager, libafl_qemu::NopEmulatorDriver, (), (), (), libafl_qemu::NopSnapshotManager>,
+    qemu: libafl_qemu::Qemu,
+    config: FunctionHookConfig
+) -> Result<(), Box<dyn std::error::Error>> 
+{
+    let FunctionHookConfig { address, action, instruction_size } = config;
+    
+    info!("Adding function hook at address: 0x{:x}", address);
+    
+    // 创建断点
+    let breakpoint = libafl_qemu::breakpoint::Breakpoint::without_command(address as libafl_qemu::GuestAddr, false);
+    let breakpoint_id = emulator.add_breakpoint(breakpoint, true);
+    info!("Breakpoint added with ID: {:?}", breakpoint_id);
+    
+    // 返回Ok，让调用者控制执行循环
+    Ok(())
+}
+
+// 运行带断点处理的仿真函数
+fn run_with_function_hooks<C: Clone>(
+    emulator: &libafl_qemu::Emulator<C, NopCommandManager, libafl_qemu::NopEmulatorDriver, (), (), (), libafl_qemu::NopSnapshotManager>,
+    qemu: libafl_qemu::Qemu,
+    hooks: Vec<FunctionHookConfig>
+) -> Result<(), Box<dyn std::error::Error>> 
+{
+    info!("Starting emulation with function hooks...");
+    let mut running = true;
+    
+    // 创建断点地址到hook配置的映射
+        let mut hook_map = std::collections::HashMap::new();
+        for hook in hooks {
+            hook_map.insert(hook.address, hook.clone());
+            setup_function_hook(emulator, qemu, hook)?;
+        }
+        
+        // 运行仿真循环
+        while running {
+            unsafe {
+                match qemu.run() {
+                    Ok(QemuExitReason::Breakpoint(addr)) => {
+                        let addr_u64 = addr as u64;
+                        info!("Breakpoint hit at address: 0x{:x}", addr_u64);
+                        
+                        // 检查是否是我们设置的断点
+                        if let Some(hook_config) = hook_map.get(&addr_u64) {
+                            info!("Processing function hook at 0x{:x}", addr_u64);
+                            
+                            // 获取CPU以修改寄存器
+                            if let Some(cpu) = qemu.cpu_from_index(0) {
+                                // 读取当前PC
+                                if let Ok(pc) = cpu.read_reg(Regs::Pc) {
+                                    info!("Current PC before modification: 0x{:x}", pc);
+                                    
+                                    // 根据hook类型执行不同的操作
+                                    match hook_config.action {
+                                        FunctionHookAction::Skip => {
+                                            // 跳过指令
+                                            let new_pc = pc + hook_config.instruction_size;
+                                            info!("Setting PC to 0x{:x} to skip instruction", new_pc);
+                                            
+                                            if let Err(e) = cpu.write_reg::<Regs, u32>(Regs::Pc, new_pc) {
+                                                info!("Failed to set PC: {:?}", e);
+                                            } else {
+                                                info!("Successfully skipped instruction at 0x{:x}", addr_u64);
+                                            }
+                                            // if let Err(e) = cpu.write_reg::<Regs, u32>(Regs::Lr, new_pc) {
+                                            //     info!("Failed to set LR: {:?}", e);
+                                            // }
+                                        },
+                                        FunctionHookAction::ModifyReturnValue(value) => {
+                                            // 修改返回值（通常是R0寄存器）
+                                            info!("Setting return value to 0x{:x}", value);
+                                            if let Err(e) = cpu.write_reg::<Regs, u32>(Regs::R0, value) {
+                                                info!("Failed to set return value: {:?}", e);
+                                            } else {
+                                                // 同时跳过指令
+                                                let new_pc = pc + hook_config.instruction_size;
+                                                info!("Setting PC to 0x{:x} to skip instruction", new_pc);
+                                                if let Err(e) = cpu.write_reg::<Regs, u32>(Regs::Pc, new_pc) {
+                                                    info!("Failed to set PC: {:?}", e);
+                                                } else {
+                                                    info!("Successfully modified return value and skipped instruction at 0x{:x}", addr_u64);
+                                                }
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    },
+                Ok(QemuExitReason::Timeout) => {
+                    info!("Emulation timed out");
+                    running = false;
+                },
+                Ok(QemuExitReason::End(QemuShutdownCause::HostSignal(signal))) => {
+                    info!("Emulation terminated by host signal: {:?}", signal);
+                    signal.handle();
+                    running = false;
+                },
+                Ok(reason) => {
+                    info!("Emulation exited with reason: {:?}", reason);
+                    running = false;
+                },
+                Err(QemuExitError::UnexpectedExit) => {
+                    info!("Emulation crashed with unexpected exit");
+                    running = false;
+                },
+                Err(e) => {
+                    info!("Emulation error: {:?}", e);
+                    running = false;
+                },
+            }
         }
     }
-
-    info!("QEMU system mode emulation completed");
     
+    info!("QEMU system mode emulation completed");
     Ok(())
 }
